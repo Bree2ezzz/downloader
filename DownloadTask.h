@@ -13,8 +13,16 @@ struct DownloadTask {
     std::atomic<int> active_segments{0};
     std::vector<std::string> temp_files;
     std::mutex task_mtx;//用于保护temp_files
-    bool paused = false; //是否暂停
-    std::vector<std::pair<int,size_t>> current_position;
+
+
+    std::atomic<bool> paused{false};
+    // 新增字段：保存每个分段的原始范围
+    std::vector<std::pair<size_t, size_t>> ranges;
+    // 保存下载任务相关的基本信息，便于续传时构造请求
+    std::string output_path;
+    std::string host;
+    std::string path;
+    int port;
 
     DownloadTask(std::shared_ptr<boost::asio::io_context> io_ctx,boost::asio::executor_work_guard<boost::asio::io_context::executor_type> wk)
         : io_context(std::move(io_ctx)) , work_guard(std::move(wk)){}
