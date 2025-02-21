@@ -53,10 +53,31 @@ bool downloader::parse_url(const std::string &url, std::string &host, std::strin
 
 void downloader::add_download_task(const std::string &url, const std::string &output_path, int thread_num)
 {
-    downloader_mtx.lock();
-    download_queue_.emplace(url,output_path,thread_num);
-    downloader_mtx.unlock();
+    {
+        std::lock_guard<std::mutex> lock(downloader_mtx);
+        download_queue_.emplace(url, output_path, thread_num);
+    }
     start_next_download();
+}
+
+void downloader::pause_download(const std::shared_ptr<DownloadTask> &task)
+{
+    std::lock_guard<std::mutex> lock(downloader_mtx);
+    auto it = active_downloads_.find(task);
+    if (it != active_downloads_.end()) {
+        task->paused = true;
+        it->second->cancel();
+    }
+}
+
+void downloader::resume_download(const std::shared_ptr<DownloadTask> &task)
+{
+    std::lock_guard<std::mutex> lock(downloader_mtx);
+    auto it = active_downloads_.find(task);
+    if(it != active_downloads_.end())
+    {
+        task->paused = true;
+    }
 }
 
 
@@ -87,65 +108,60 @@ void downloader::start_next_download()
     }
     auto task = std::make_shared<DownloadTask>(file_io_context_,work_guard);
     task->threads = std::move(file_threads);
+    //保存信息方便续传
+    task->output_path = output_path;
+    task->host = host;
+    task->path = path;
+    task->port = port;
+
 
     auto client = std::make_shared<tcp_client>(file_io_context_);
     {
         std::lock_guard<std::mutex> lock(downloader_mtx);
-        active_downloads_.insert(client);
+        active_downloads_[task] = client;
     }
-    // downloader_mtx.lock();
-    // active_downloads_.insert(client);
-    // downloader_mtx.unlock();
-    client->async_connect(host,port,[client,this](boost::system::error_code ec) {
+
+    client->async_connect(host,port,[client,this,task, host, path, port, output_path, thread_num](boost::system::error_code ec) {
         if(ec)
         {
             handle_error(client);
+            return;
         }
-    });
-
-    std::string head_request = build_head_request(path, host);//构造head请求
-    /*发送head请求后的处理逻辑
-     * 构造head请求后，调用send_request函数发送head请求，两个参数为请求文本、接受string变量返回void的函数func
-     *在send_request的回调函数中执行read_response，func通过参数从send传递给read。read执行完后，read的回调
-     *函数会执行func。
-     */
-    client->send_head_request(head_request,
-        [this,client,thread_num,host,path,file_io_context_,port,output_path,task]
-        (const std::string& response) {
-        size_t file_size = parse_head_response(response);
-        if (file_size == 0)
-        {
+        std::string head_request = build_head_request(path, host);//构造head请求
+        /*发送head请求后的处理逻辑
+ * 构造head请求后，调用send_request函数发送head请求，两个参数为请求文本、接受string变量返回void的函数func
+ *在send_request的回调函数中执行read_response，func通过参数从send传递给read。read执行完后，read的回调
+ *函数会执行func。
+ */
+        client->send_head_request(head_request,[this,client,thread_num,host,path,port,output_path,task](const std::string &response) {
+            size_t file_size = parse_head_response(response);
+            if (file_size == 0)
             {
-                std::lock_guard<std::mutex> lock(downloader_mtx);
-                active_downloads_.erase(client);
-            }
-            return; // 获取大小失败
-        }
-        auto ranges = split_file_into_ranges(file_size,thread_num);
-        std::vector<std::shared_ptr<tcp_client>> segment_clients;
-
-
-        for(int i = 0; i < static_cast<int>(ranges.size()); ++i)
-        {
-            auto range = ranges[i];
-            std::string get_request = build_get_request(path,host,range.first,range.second);
-            auto segment_client = std::make_shared<tcp_client>(file_io_context_);
-                segment_clients.push_back(segment_client);
-            //连接
-            segment_client->async_connect(host,port,
-                [client,this,segment_client,get_request,output_path,range,i,task,thread_num]
-                (boost::system::error_code ec) {
-                if(ec)
                 {
-                    handle_error(client);
-                    return;
+                    std::lock_guard<std::mutex> lock(downloader_mtx);
+                    active_downloads_.erase(task);
                 }
+                return; // 获取大小失败
+            }
+            auto ranges = split_file_into_ranges(file_size,thread_num);
+            task->ranges = ranges;
+
+            for(int i = 0; i < static_cast<int>(ranges.size()); ++i)
+            {
+                auto range = ranges[i];
+                std::string get_request = build_get_request(path,host,range.first,range.second,0);
+                auto segment_client = std::make_shared<tcp_client>(task->io_context);
+                //连接
+                segment_client->async_connect(host,task->port,[client,this,segment_client,get_request,output_path,range,i,task,thread_num](boost::system::error_code ec) {
+                    if (ec) {
+                        handle_error(client);
+                        return;
+                    }
                     ++task->active_segments;
-                segment_client->send_get_request(task,i,output_path,get_request,
-                    [output_path,range,this,i,task,thread_num]() {
+                    segment_client->send_get_request(task,i,output_path,get_request,[output_path,range,this,i,task,thread_num]() {
                         {
-                            std::lock_guard<std::mutex> lock(task->task_mtx);
-                            task->temp_files.emplace_back(output_path + ".temp_" + std::to_string(i));
+                           std::lock_guard<std::mutex> lock(task->task_mtx);
+                           task->temp_files.emplace_back(output_path + ".temp_" + std::to_string(i));
                         }
                         --task->active_segments;
                         if(task->active_segments == 0)
@@ -163,16 +179,17 @@ void downloader::start_next_download()
                             merge_thread.detach();
                         }
                     });
-            });
-
-        }
+                });
+            }
+            //这里是for循环结束
             {
-            std::lock_guard<std::mutex> lock(downloader_mtx);
-            active_downloads_.erase(client);
+                std::lock_guard<std::mutex> lock(downloader_mtx);
+                active_downloads_.erase(task);
             }
             start_next_download();
-    });
+        });
 
+    });
 }
 
 std::vector<std::pair<size_t,size_t>> downloader::split_file_into_ranges(size_t file_size, int thread_num)
@@ -196,9 +213,15 @@ std::vector<std::pair<size_t,size_t>> downloader::split_file_into_ranges(size_t 
 
 std::string downloader::build_get_request(const std::string &path, const std::string &host,size_t start, size_t end)
 {
+    return build_get_request(path,host,start,end,0);
+}
+
+std::string downloader::build_get_request(const std::string &path, const std::string &host, size_t start, size_t end,
+    size_t downloaded_offset)
+{
     std::string request = "GET " + path + " HTTP/1.1\r\n"
                           "Host: " + host + "\r\n"
-                          "Range: bytes=" + std::to_string(start) + "-" + std::to_string(end) + "\r\n"
+                          "Range: bytes=" + std::to_string(start + downloaded_offset) + "-" + std::to_string(end) + "\r\n"
                           "Connection: close\r\n"
                           "\r\n";
     return request;
@@ -207,7 +230,14 @@ std::string downloader::build_get_request(const std::string &path, const std::st
 void downloader::handle_error(std::shared_ptr<tcp_client> client)
 {
     std::lock_guard<std::mutex> lock(downloader_mtx);
-    active_downloads_.erase(client);
+    for(auto it = active_downloads_.begin();it != active_downloads_.end(); ++it)
+    {
+        if(it->second == client)
+        {
+            active_downloads_.erase(it);
+            break;
+        }
+    }
 }
 
 
