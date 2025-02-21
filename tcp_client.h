@@ -20,7 +20,7 @@ public:
     void read_get_response(const std::shared_ptr<DownloadTask>& task,int i,const std::string & output_path,const std::function<void(void)>& on_response);//解析get回复
     void async_read_remain_data(std::function<void(void)> on_response,
          std::size_t remaining_bytes,std::shared_ptr<std::ofstream> file_stream);//读取剩余文件数据
-
+    void cancel();
 
 
 private:

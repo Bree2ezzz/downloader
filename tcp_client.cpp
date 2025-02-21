@@ -83,7 +83,7 @@ void tcp_client::send_get_request(const std::shared_ptr<DownloadTask>& task,int 
 {
     //发送get请求后会得到返回体，返回体为string类型，回调函数去处理这个string
     auto self = shared_from_this();
-    boost::asio::async_write(socket_,response_buffer_,
+    boost::asio::async_write(socket_,boost::asio::buffer(request),
         [on_response,self,i,output_path,task](const boost::system::error_code &ec,size_t length) {
         if(!ec)
         {
@@ -136,15 +136,26 @@ void tcp_client::read_get_response(const std::shared_ptr<DownloadTask>& task,int
             std::ostringstream file_data;
             file_data << response_stream.rdbuf();//将可能多读的数据提取
             std::string temp_file_name = output_path + ".temp_" + std::to_string(i);
-            auto file_stream = std::make_shared<std::ofstream>(temp_file_name,std::ios::binary | std::ios::out);
+            auto file_stream = std::make_shared<std::ofstream>(temp_file_name,std::ios::binary | std::ios::out | std::ios::app);
             if (!file_stream->is_open())
-                {
-                    std::cerr << "Failed to open file for writing.\n";
-                    std::exit(EXIT_FAILURE);
-                    return;  // 或其他错误处理
-                }
-            task->temp_files.emplace_back(temp_file_name);
+            {
+                std::cerr << "Failed to open file for writing.\n";
+                std::exit(EXIT_FAILURE);
+                return;  // 或其他错误处理
+            }
             file_stream->write(file_data.str().data(),static_cast<std::streamsize>(file_data.str().size()));//这里是多读部分，不会超过streamsize
+            if (task->paused) {
+                self->cancel();
+                return;
+            }
+                {
+                    std::lock_guard<std::mutex> lock(task->task_mtx);
+                    // 确保该临时文件名称已保存到 task->temp_files 中
+                    auto it = std::find(task->temp_files.begin(), task->temp_files.end(), temp_file_name);
+                    if (it == task->temp_files.end()) {
+                        task->temp_files.push_back(temp_file_name);
+                    }
+                }
             if(file_data.str().size() < content_length)
             {
                 size_t remain_size = content_length - file_data.str().size();
@@ -196,5 +207,11 @@ void tcp_client::async_read_remain_data(std::function<void(void)> on_response,
             }
     });
 
+}
+
+void tcp_client::cancel()
+{
+    boost::system::error_code ec;
+    socket_.close(ec);
 }
 
