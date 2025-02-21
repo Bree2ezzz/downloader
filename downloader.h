@@ -42,6 +42,7 @@ private:
     std::vector<std::pair<size_t,size_t>> split_file_into_ranges(size_t file_size,int thread_num);
 
     void handle_error(std::shared_ptr<tcp_client> client);
+    void handle_error(std::shared_ptr<DownloadTask> task);
     void merge_file(const std::string& output_path,std::shared_ptr<DownloadTask> task);
     auto delete_temp_file(const std::shared_ptr<DownloadTask>& task) -> void;
 
