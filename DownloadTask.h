@@ -6,6 +6,7 @@
 #define DOWNLOADTASK_H
 #include <memory>
 #include <boost/asio/io_context.hpp>
+#include <boost/asio/ssl.hpp>
 struct DownloadTask {
     std::shared_ptr<boost::asio::io_context> io_context;
     boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work_guard;
@@ -22,9 +23,21 @@ struct DownloadTask {
     std::string output_path;
     std::string host;
     std::string path;
-    int port;
+    int port{0};
+    std::shared_ptr<boost::asio::ssl::context> ssl_context_ = nullptr;
+    bool use_ssl = false;
 
     DownloadTask(std::shared_ptr<boost::asio::io_context> io_ctx,boost::asio::executor_work_guard<boost::asio::io_context::executor_type> wk)
         : io_context(std::move(io_ctx)) , work_guard(std::move(wk)){}
+
+    ~DownloadTask();
 };
+
+inline DownloadTask::~DownloadTask()
+{
+    for(auto & thread : threads)
+    {
+        thread.join();
+    }
+}
 #endif //DOWNLOADTASK_H
