@@ -13,9 +13,17 @@ Content-Type: application/octet-stream\r\n
 
 #include <iostream>
 #include <fstream>
-tcp_client::tcp_client(const std::shared_ptr<boost::asio::io_context>& io_context)
-: socket_(*io_context) , resolver_(*io_context)
+tcp_client::tcp_client(const std::shared_ptr<boost::asio::io_context>& io_context,bool use_ssl,const std::shared_ptr<boost::asio::ssl::context>& context)
+: resolver_(*io_context) , use_ssl_(use_ssl)
 {
+    if(use_ssl_)
+    {
+        ssl_socket_ = std::make_unique<boost::asio::ssl::stream<boost::asio::ip::tcp::socket>>(*io_context,*context);//https初始化
+    }
+    else
+    {
+        socket_ = std::make_unique<boost::asio::ip::tcp::socket>(*io_context);  // HTTP 初始化
+    }
 }
 
 void tcp_client::async_connect(const std::string &host, int port,
@@ -30,14 +38,31 @@ void tcp_client::async_connect(const std::string &host, int port,
             callback(ec);
             return;
         }
-            boost::asio::async_connect(self->socket_,endpoints,
-                [self,callback](boost::system::error_code ec,boost::asio::ip::tcp::endpoint endpoint) {
+
+        if(!self->use_ssl_)
+        {//普通socket指针要解引用，ssl_socket不要解引用 用lowest_layer获取最底层socket即可。
+            boost::asio::async_connect(*(self->socket_),endpoints,[self,callback](boost::system::error_code ec,boost::asio::ip::tcp::endpoint endpoint) {
+                if(ec)
+                    {
+                        std::cerr << "connect error" << ec.message() << std::endl;
+                    }
+                callback(ec);
+            });
+        }else
+        {//使用ssl_socket连接  多了一个握手
+            boost::asio::async_connect((self->ssl_socket_)->lowest_layer(),endpoints,[self,callback](boost::system::error_code ec,boost::asio::ip::tcp::endpoint endpoint) {
                 if(ec)
                 {
                     std::cerr << "connect error" << ec.message() << std::endl;
-                }
                     callback(ec);
+                    return;
+                }
+                self->ssl_socket_->async_handshake(boost::asio::ssl::stream_base::client,
+                        [self, callback](boost::system::error_code ec) {
+                            callback(ec);  // 握手完成后执行回调
+                        });
             });
+        }
     });
 }
 
@@ -45,37 +70,25 @@ void tcp_client::async_connect(const std::string &host, int port,
 void tcp_client::send_head_request(const std::string &request, std::function<void(const std::string &)> on_response)
 {
     auto self = shared_from_this(); // 确保对象在异步调用期间不会被销毁
-    boost::asio::async_write(socket_, boost::asio::buffer(request),
-        [self, on_response](boost::system::error_code ec,std::size_t /*length*/) {
-            //异步写入和读取函数结束后都会向回调函数传递error_code和要发送/接收的字节数
-            if (!ec) {
-                self->read_head_response(on_response); // 发送成功后，异步读取响应
-            } else {
-                std::exit(EXIT_FAILURE);
-                on_response(""); // 发生错误，返回空字符串
-            }
-        }
-    );
+    if(use_ssl_)
+    {
+        do_send_head_request(*ssl_socket_,request,on_response,self);
+    }else
+    {
+        do_send_head_request(*socket_,request,on_response,self);
+    }
 }
 
 void tcp_client::read_head_response(const std::function<void(const std::string &)>& on_response)
 {
     auto self = shared_from_this();
-    boost::asio::async_read_until(socket_,response_buffer_,"\r\n\r\n",
-        [self,on_response](boost::system::error_code ec, std::size_t length) {
-            if(!ec)
-            {
-                std::istream response_stream(&self->response_buffer_);
-                std::string response(length, '\0');
-                response_stream.read(&response[0], static_cast<std::streamsize>(length));
-                //将size_t转换为streamsize可能有超出风险，但此处只是head请求回复，不会超出
-                on_response(response); // 回调
-            }else
-            {
-                std::exit(EXIT_FAILURE);
-                on_response(""); // 读取失败
-            }
-        });
+    if(use_ssl_)
+    {
+        do_read_head_response(*ssl_socket_,on_response,self);
+    }else
+    {
+        do_read_head_response(*socket_,on_response,self);
+    }
 }
 
 void tcp_client::send_get_request(const std::shared_ptr<DownloadTask>& task,int i,const std::string & output_path,const std::string &request,
@@ -83,7 +96,89 @@ void tcp_client::send_get_request(const std::shared_ptr<DownloadTask>& task,int 
 {
     //发送get请求后会得到返回体，返回体为string类型，回调函数去处理这个string
     auto self = shared_from_this();
-    boost::asio::async_write(socket_,boost::asio::buffer(request),
+    if(use_ssl_)
+    {
+        do_send_get_request(*ssl_socket_,task,i,output_path,request,on_response,self);
+    }else
+    {
+        do_send_get_request(*socket_,task,i,output_path,request,on_response,self);
+    }
+}
+
+void tcp_client::read_get_response(const std::shared_ptr<DownloadTask>& task,int i,const std::string & output_path,const std::function<void(void)>& on_response)
+{
+    auto self = shared_from_this();
+    if(use_ssl_)
+    {
+        do_read_get_response(*ssl_socket_,task,i,output_path,on_response,self);
+    }else
+    {
+        do_read_get_response(*socket_,task,i,output_path,on_response,self);
+    }
+}
+
+void tcp_client::async_read_remain_data(std::function<void(void)> on_response,
+    std::size_t remaining_bytes,std::shared_ptr<std::ofstream> file_stream)
+{
+    auto self = shared_from_this();
+    if(use_ssl_)
+    {
+        do_async_read_remain_data(*ssl_socket_,on_response,remaining_bytes,file_stream,self);
+    } else
+    {
+        do_async_read_remain_data(*socket_,on_response,remaining_bytes,file_stream,self);
+    }
+}
+
+void tcp_client::cancel()
+{
+    boost::system::error_code ec;
+    if (socket_) socket_->close(ec);
+    if (ssl_socket_) ssl_socket_->lowest_layer().close(ec);
+}
+
+template<typename StreamType>
+    void tcp_client::do_send_head_request(StreamType & stream,const std::string& request,std::function<void(const std::string &)> on_response,std::shared_ptr<tcp_client> self)
+{
+    boost::asio::async_write(stream,boost::asio::buffer(request),[self,on_response](boost::system::error_code ec, std::size_t /*length*/) {
+        if(!ec)
+        {
+            self->read_head_response(on_response);
+        }else
+        {
+            std::exit(EXIT_FAILURE);
+            on_response("");
+        }
+    });
+}
+
+template<typename StreamType>
+void tcp_client::do_read_head_response(StreamType &stream, const std::function<void(const std::string &)> &on_response,
+    std::shared_ptr<tcp_client> self)
+{
+    boost::asio::async_read_until(stream,response_buffer_,"\r\n\r\n",
+            [self,on_response](boost::system::error_code ec, std::size_t length) {
+                if(!ec)
+                {
+                    std::istream response_stream(&self->response_buffer_);
+                    std::string response(length, '\0');
+                    response_stream.read(&response[0], static_cast<std::streamsize>(length));
+                    //将size_t转换为streamsize可能有超出风险，但此处只是head请求回复，不会超出
+                    on_response(response); // 回调
+                }else
+                {
+                    std::exit(EXIT_FAILURE);
+                    on_response(""); // 读取失败
+                }
+            });
+}
+
+template<typename StreamType>
+void tcp_client::do_send_get_request(StreamType &stream, const std::shared_ptr<DownloadTask> &task, int i,
+    const std::string &output_path, const std::string &request, const std::function<void()> &on_response,
+    std::shared_ptr<tcp_client> self)
+{
+    boost::asio::async_write(stream,boost::asio::buffer(request),
         [on_response,self,i,output_path,task](const boost::system::error_code &ec,size_t length) {
         if(!ec)
         {
@@ -96,10 +191,11 @@ void tcp_client::send_get_request(const std::shared_ptr<DownloadTask>& task,int 
     });
 }
 
-void tcp_client::read_get_response(const std::shared_ptr<DownloadTask>& task,int i,const std::string & output_path,const std::function<void(void)>& on_response)
+template<typename StreamType>
+void tcp_client::do_read_get_response(StreamType &stream, const std::shared_ptr<DownloadTask> &task, int i,
+    const std::string &output_path, const std::function<void()> &on_response,std::shared_ptr<tcp_client> self)
 {
-    auto self = shared_from_this();
-    boost::asio::async_read_until(socket_,response_buffer_,"\r\n\r\n",
+    boost::asio::async_read_until(stream,self->response_buffer_,"\r\n\r\n",
         [on_response,self,i,output_path,task](boost::system::error_code ec,size_t length) {
         if(!ec)
         {
@@ -170,18 +266,18 @@ void tcp_client::read_get_response(const std::shared_ptr<DownloadTask>& task,int
     });
 }
 
-void tcp_client::async_read_remain_data(std::function<void(void)> on_response,
-    std::size_t remaining_bytes,std::shared_ptr<std::ofstream> file_stream)
+template<typename StreamType>
+void tcp_client::do_async_read_remain_data(StreamType &stream, std::function<void()> on_response,
+    std::size_t remaining_bytes, std::shared_ptr<std::ofstream> file_stream,std::shared_ptr<tcp_client> self)
 {
-
-    auto self = shared_from_this();
     auto buffer = std::make_shared<std::vector<char>>(4096);
     std::size_t bytes_to_read = std::min<std::size_t>(buffer->size(), remaining_bytes);
-    socket_.async_read_some(boost::asio::buffer(*buffer,bytes_to_read),
+    stream.async_read_some(boost::asio::buffer(*buffer,bytes_to_read),
         [file_stream,buffer,self,remaining_bytes,on_response](boost::system::error_code ec,size_t length) {
         if(ec)
         {
             std::cerr << "Read error: " << ec.message() << std::endl;
+            file_stream->close();
             std::exit(EXIT_FAILURE);
             return;
         }
@@ -189,6 +285,7 @@ void tcp_client::async_read_remain_data(std::function<void(void)> on_response,
         if (!file_stream->good())
         {
             std::cerr << "File write error." << std::endl;
+            file_stream->close();
             std::exit(EXIT_FAILURE);
             return;
         }
@@ -206,12 +303,4 @@ void tcp_client::async_read_remain_data(std::function<void(void)> on_response,
                 }
             }
     });
-
 }
-
-void tcp_client::cancel()
-{
-    boost::system::error_code ec;
-    socket_.close(ec);
-}
-
