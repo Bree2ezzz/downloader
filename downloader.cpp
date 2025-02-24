@@ -117,7 +117,7 @@ void downloader::resume_download(const std::shared_ptr<DownloadTask> &task)
         {//该分段已下完，跳过
             continue;
         }
-        auto segment_client = std::make_shared<tcp_client>(task->io_context);
+        auto segment_client = std::make_shared<tcp_client>(task->io_context,task->use_ssl,task->ssl_context_);
         std::string get_request = build_get_request(task->path, task->host, range.first, range.second, downloaded);
         segment_client->async_connect(task->host,task->port,[this,segment_client,get_request,task,i,temp_file](boost::system::error_code ec) {
             if (ec) {
@@ -134,23 +134,29 @@ void downloader::resume_download(const std::shared_ptr<DownloadTask> &task)
                     }
                 }
                 --task->active_segments;
-                       if(task->active_segments == 0)
-                       {
-                           task->work_guard.reset();
-                           //join线程和合并文件
-                           for(auto & thread : task->threads)
-                           {
-                               thread.join();
-                           }
-                           std::thread merge_thread([this,task]() {
-                               merge_file(task->output_path,task);
-                               delete_temp_file(task);
-                           });
-                           merge_thread.detach();
-                       }
+                if (task->active_segments == 0)
+                {
+                    task->work_guard.reset();
+                    //join线程和合并文件
+                    for (auto &thread: task->threads)
+                    {
+                        thread.join();
+                    }
+                    std::thread merge_thread([this,task]() {
+                        merge_file(task->output_path, task);
+                        delete_temp_file(task);
+                    });
+                    merge_thread.detach();
+                }
             });
         });
     }
+    //这里是for循环结束
+    {
+        std::lock_guard<std::mutex> lock(downloader_mtx);
+        active_downloads_.erase(task);
+    }
+    start_next_download();
 }
 
 
@@ -170,6 +176,7 @@ void downloader::start_next_download()
     int port;
     if (!parse_url(url, host, path, port)) return; // 解析失败
 
+
     auto file_io_context_ = std::make_shared<boost::asio::io_context>();//每个文件一个io_ctx，避免资源竞争，实现多文件不同线程数下载
     const auto work_guard = boost::asio::make_work_guard(*file_io_context_);
 
@@ -186,9 +193,16 @@ void downloader::start_next_download()
     task->host = host;
     task->path = path;
     task->port = port;
+    if(port == 443)
+    {
+        task->use_ssl = true;
+        task->ssl_context_ = std::make_shared<boost::asio::ssl::context>(boost::asio::ssl::context::tlsv12_client);
+        task->ssl_context_->set_verify_mode(boost::asio::ssl::verify_peer);
+        task->ssl_context_->load_verify_file("path/to/cert.pem"); // 加载证书
+    }
 
 
-    auto client = std::make_shared<tcp_client>(file_io_context_);
+    auto client = std::make_shared<tcp_client>(file_io_context_,task->use_ssl,task->ssl_context_);
     {
         std::lock_guard<std::mutex> lock(downloader_mtx);
         active_downloads_[task] = client;
@@ -223,20 +237,21 @@ void downloader::start_next_download()
             {
                 auto range = ranges[i];
                 std::string get_request = build_get_request(path,host,range.first,range.second,0);
-                auto segment_client = std::make_shared<tcp_client>(task->io_context);
+                auto segment_client = std::make_shared<tcp_client>(task->io_context,task->use_ssl,task->ssl_context_);
                 //连接
-                segment_client->async_connect(host,task->port,[client,this,segment_client,get_request,output_path,range,i,task,thread_num](boost::system::error_code ec) {
+                segment_client->async_connect(host,task->port,[segment_client,client,this,segment_client,get_request,output_path,range,i,task,thread_num](boost::system::error_code ec) {
                     if (ec) {
                         handle_error(client);
                         return;
                     }
                     ++task->active_segments;
-                    segment_client->send_get_request(task,i,output_path,get_request,[output_path,range,this,i,task,thread_num]() {
+                    segment_client->send_get_request(task,i,output_path,get_request,[segment_client,output_path,range,this,i,task,thread_num]() {
                         {
                            std::lock_guard<std::mutex> lock(task->task_mtx);
                            task->temp_files.emplace_back(output_path + ".temp_" + std::to_string(i));
                         }
                         --task->active_segments;
+                        segment_client->cancel();
                         if(task->active_segments == 0)
                         {
                             task->work_guard.reset();
@@ -245,8 +260,8 @@ void downloader::start_next_download()
                             {
                                 thread.join();
                             }
-                            std::thread merge_thread([output_path,this,task]() {
-                                merge_file(output_path,task);
+                            std::thread merge_thread([this,task]() {
+                                merge_file(task->output_path,task);
                                 delete_temp_file(task);
                             });
                             merge_thread.detach();

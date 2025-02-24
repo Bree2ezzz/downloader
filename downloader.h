@@ -9,7 +9,6 @@
 #include <regex>
 #include <boost/asio.hpp>
 #include "tcp_client.h"
-#include <set>
 #include <queue>
 #include <memory>
 #include <utility>
@@ -51,8 +50,6 @@ private:
     std::queue<std::tuple<std::string, std::string, int>> download_queue_; // (url, output_path, thread_num)
     std::map<std::shared_ptr<DownloadTask>, std::shared_ptr<tcp_client>> active_downloads_;
     std::mutex downloader_mtx;//用于保护active_downloads。
-
-
 
 
 
