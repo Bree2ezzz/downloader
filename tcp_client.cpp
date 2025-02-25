@@ -137,6 +137,19 @@ void tcp_client::cancel()
     if (ssl_socket_) ssl_socket_->lowest_layer().close(ec);
 }
 
+void tcp_client::async_write_file(std::shared_ptr<std::ofstream> file_stream,
+    const std::shared_ptr<std::vector<char>> &buffer, size_t length)
+{
+    boost::asio::async_write(*file_stream, boost::asio::buffer(*buffer, length),
+        [file_stream](boost::system::error_code ec, std::size_t /*length*/) {
+        if (ec) {
+            std::cerr << "Error writing to file: " << ec.message() << std::endl;
+            file_stream->close();
+            std::exit(EXIT_FAILURE);
+        }
+    });
+}
+
 template<typename StreamType>
     void tcp_client::do_send_head_request(StreamType & stream,const std::string& request,std::function<void(const std::string &)> on_response,std::shared_ptr<tcp_client> self)
 {
@@ -195,8 +208,11 @@ template<typename StreamType>
 void tcp_client::do_read_get_response(StreamType &stream, const std::shared_ptr<DownloadTask> &task, int i,
     const std::string &output_path, const std::function<void()> &on_response,std::shared_ptr<tcp_client> self)
 {
+    constexpr  size_t buffer_size = 64 * 1024; // 64KB 缓冲区
+    auto buffer = std::make_shared<std::vector<char>>(buffer_size);
+
     boost::asio::async_read_until(stream,self->response_buffer_,"\r\n\r\n",
-        [on_response,self,i,output_path,task](boost::system::error_code ec,size_t length) {
+        [on_response,self,i,output_path,task,buffer](boost::system::error_code ec,size_t length) {
         if(!ec)
         {
             std::istream response_stream(&self->response_buffer_);
@@ -207,28 +223,7 @@ void tcp_client::do_read_get_response(StreamType &stream, const std::shared_ptr<
                 // 不是分段下载的返回，错误处理
                 return;
             }
-            std::size_t content_length = 0;
-            while (std::getline(response_stream, header) && !header.empty())
-            {
-                // 移除末尾的 \r（如果有）
-                if (!header.empty() && header.back() == '\r') {
-                    header.pop_back();
-                }
 
-                // 查找 Content-Length
-                size_t pos = header.find("Content-Length:");
-                if (pos != std::string::npos) {
-                    // 动态计算 Content-Length 值的起始位置
-                    size_t start = pos + 16; // "Content-Length:" 的长度是 16
-                    try {
-                        content_length = std::stoul(header.substr(start));
-                    } catch (const std::invalid_argument& e) {
-                        std::cerr << "Error: Invalid Content-Length value!" << std::endl;
-                    } catch (const std::out_of_range& e) {
-                        std::cerr << "Error: Content-Length value out of range!" << std::endl;
-                    }
-                }
-            }
             std::ostringstream file_data;
             file_data << response_stream.rdbuf();//将可能多读的数据提取
             std::string temp_file_name = output_path + ".temp_" + std::to_string(i);
@@ -240,6 +235,12 @@ void tcp_client::do_read_get_response(StreamType &stream, const std::shared_ptr<
                 return;  // 或其他错误处理
             }
             file_stream->write(file_data.str().data(),static_cast<std::streamsize>(file_data.str().size()));//这里是多读部分，不会超过streamsize
+            if (!file_stream->good()) {
+                std::cerr << "File write error.\n";
+                file_stream->close();
+                std::exit(EXIT_FAILURE);
+                return;
+            }
             if (task->paused) {
                 self->cancel();
                 return;
@@ -252,9 +253,9 @@ void tcp_client::do_read_get_response(StreamType &stream, const std::shared_ptr<
                         task->temp_files.push_back(temp_file_name);
                     }
                 }
-            if(file_data.str().size() < content_length)
+            if(file_data.str().size() < task->ranges[i].second - task->ranges[i].first + 1)
             {
-                size_t remain_size = content_length - file_data.str().size();
+                size_t remain_size = (task->ranges[i].second - task->ranges[i].first + 1) - file_data.str().size();
                 self->async_read_remain_data(on_response,remain_size,file_stream);
             }
         }
@@ -270,8 +271,10 @@ template<typename StreamType>
 void tcp_client::do_async_read_remain_data(StreamType &stream, std::function<void()> on_response,
     std::size_t remaining_bytes, std::shared_ptr<std::ofstream> file_stream,std::shared_ptr<tcp_client> self)
 {
-    auto buffer = std::make_shared<std::vector<char>>(4096);
-    std::size_t bytes_to_read = std::min<std::size_t>(buffer->size(), remaining_bytes);
+    constexpr  size_t buffer_size = 64 * 1024;//64kb缓冲区
+    auto buffer = std::make_shared<std::vector<char>>(buffer_size);
+    std::size_t bytes_to_read = std::min<std::size_t>(buffer_size, remaining_bytes);
+
     stream.async_read_some(boost::asio::buffer(*buffer,bytes_to_read),
         [file_stream,buffer,self,remaining_bytes,on_response](boost::system::error_code ec,size_t length) {
         if(ec)
@@ -281,14 +284,7 @@ void tcp_client::do_async_read_remain_data(StreamType &stream, std::function<voi
             std::exit(EXIT_FAILURE);
             return;
         }
-        file_stream->write(buffer->data(),static_cast<std::streamsize>(length));
-        if (!file_stream->good())
-        {
-            std::cerr << "File write error." << std::endl;
-            file_stream->close();
-            std::exit(EXIT_FAILURE);
-            return;
-        }
+        self->async_write_file(file_stream,buffer,static_cast<std::streamsize>(length));
         std::size_t new_remaining = remaining_bytes - length;
             if (new_remaining > 0) {
                 // 继续读取剩余数据

@@ -24,6 +24,8 @@ public:
          std::size_t remaining_bytes,std::shared_ptr<std::ofstream> file_stream);//读取剩余文件数据
     void cancel();
 
+    void async_write_file(std::shared_ptr<std::ofstream> file_stream, const std::shared_ptr<std::vector<char>>& buffer, size_t length);
+
 
 private:
     std::unique_ptr<boost::asio::ip::tcp::socket> socket_;  // http socket
