@@ -24,12 +24,14 @@ bool downloader::parse_url(const std::string &url, std::string &host, std::strin
      * 使用正则表达式分割，从而获得host path和port。
      * http协议port未指定为默认80
      */
-    std::regex url_regex(R"(^(http|https)://([^;/]+)(?::(\d+))?(/.*)?$)");
-    /*正则表达式
-     * 从^开始  $结束。需要从url里解析出多条信息，用（）进行分组
-     * 第一组（http|https） ://是url固定写法，不记录在分组里
-     * 第二组([^:/]+) 匹配:或/前的一个或多个字符 第三组(?:   )这里代表非捕获分组，为了将后续的:和数字绑定在一起
-     * 最外面的？代表这一部分可选 第四组代表从/开始所有的字符，且该部分可选
+    // 正则表达式改进
+    std::regex url_regex(R"(^(http|https)://([^:/?#]+)(?::(\d+))?(/[^?#]*)?$)");
+    /*
+     * 正则表达式解释：
+     * ^(http|https):// 匹配协议部分（http 或 https）
+     * ([^:/?#]+) 匹配主机部分，直到遇到 :、/、? 或 # 为止
+     * (?::(\d+))? 匹配可选的端口部分
+     * (/[^?#]*)? 匹配路径部分，直到遇到 ? 或 # 为止
      */
     std::smatch match;
     if(!std::regex_match(url,match,url_regex))
@@ -53,6 +55,7 @@ bool downloader::parse_url(const std::string &url, std::string &host, std::strin
 void downloader::handle_error(std::shared_ptr<DownloadTask> task)
 {
     {
+        spdlog::warn("handle_error task tiggered");
         std::lock_guard<std::mutex> lock(downloader_mtx);
         active_downloads_.erase(task);
     }
@@ -66,6 +69,7 @@ void downloader::add_download_task(const std::string &url, const std::string &ou
         std::lock_guard<std::mutex> lock(downloader_mtx);
         download_queue_.emplace(url, output_path, thread_num);
     }
+    std::cout << "kaishile" <<std::endl;
     start_next_download();
 }
 
@@ -122,7 +126,7 @@ void downloader::resume_download(const std::shared_ptr<DownloadTask> &task)
         segment_client->async_connect(task->host,task->port,[this,segment_client,get_request,task,i,temp_file](boost::system::error_code ec) {
             if (ec) {
                 handle_error(task);
-                return;
+                // return;
             }
             ++task->active_segments;
             segment_client->send_get_request(task,static_cast<int>(i),task->output_path,get_request,[task,this,temp_file]() {
@@ -175,7 +179,7 @@ void downloader::start_next_download()
     std::string host, path;
     int port;
     if (!parse_url(url, host, path, port)) return; // 解析失败
-
+    spdlog::info("the program starts a download task");
 
     auto file_io_context_ = std::make_shared<boost::asio::io_context>();//每个文件一个io_ctx，避免资源竞争，实现多文件不同线程数下载
     const auto work_guard = boost::asio::make_work_guard(*file_io_context_);
@@ -187,7 +191,25 @@ void downloader::start_next_download()
         });
     }
     auto task = std::make_shared<DownloadTask>(file_io_context_,work_guard);
-    task->threads = std::move(file_threads);
+
+    // 确保 file_threads 里每个线程都是 joinable
+    spdlog::info("file_threads size before move: {}", file_threads.size());
+    for (size_t i = 0; i < file_threads.size(); ++i) {
+        spdlog::info("file_threads[{}] joinable: {}", i, file_threads[i].joinable());
+    }
+
+    // 逐个 move 到 task->threads，防止丢失线程
+    task->threads.clear();
+    for (auto& thread : file_threads) {
+        task->threads.push_back(std::move(thread));
+    }
+
+    // 确保 task->threads 里每个线程都是 joinable
+    spdlog::info("task->threads size after move: {}", task->threads.size());
+    for (size_t i = 0; i < task->threads.size(); ++i) {
+        spdlog::info("task->threads[{}] joinable: {}", i, task->threads[i].joinable());
+    }
+
     //保存信息方便续传
     task->output_path = output_path;
     task->host = host;
@@ -207,13 +229,14 @@ void downloader::start_next_download()
         std::lock_guard<std::mutex> lock(downloader_mtx);
         active_downloads_[task] = client;
     }
-
+    spdlog::info("the client of connect start the connection");
     client->async_connect(host,port,[client,this,task, host, path, port, output_path, thread_num](boost::system::error_code ec) {
         if(ec)
         {
             handle_error(client);
-            return;
+            // return;
         }
+        spdlog::info("connect success");
         std::string head_request = build_head_request(path, host);//构造head请求
         /*发送head请求后的处理逻辑
  * 构造head请求后，调用send_request函数发送head请求，两个参数为请求文本、接受string变量返回void的函数func
@@ -232,49 +255,37 @@ void downloader::start_next_download()
             }
             auto ranges = split_file_into_ranges(file_size,thread_num);
             task->ranges = ranges;
-
+            spdlog::info("Header response parsing ends and segmentation ends");
             for(int i = 0; i < static_cast<int>(ranges.size()); ++i)
             {
                 auto range = ranges[i];
                 std::string get_request = build_get_request(path,host,range.first,range.second,0);
                 auto segment_client = std::make_shared<tcp_client>(task->io_context,task->use_ssl,task->ssl_context_);
                 //连接
-                segment_client->async_connect(host,task->port,[segment_client,client,this,segment_client,get_request,output_path,range,i,task,thread_num](boost::system::error_code ec) {
+                segment_client->async_connect(host,task->port,[segment_client,client,this,get_request,output_path,range,i,task,thread_num](boost::system::error_code ec) {
                     if (ec) {
                         handle_error(client);
-                        return;
+                        // return;
                     }
+                    spdlog::info(i + "Thread connection is successful");
                     ++task->active_segments;
                     segment_client->send_get_request(task,i,output_path,get_request,[segment_client,output_path,range,this,i,task,thread_num]() {
-                        {
-                           std::lock_guard<std::mutex> lock(task->task_mtx);
-                           task->temp_files.emplace_back(output_path + ".temp_" + std::to_string(i));
-                        }
+                        spdlog::info("{} Thread Complete the task", i);
                         --task->active_segments;
                         segment_client->cancel();
                         if(task->active_segments == 0)
                         {
-                            task->work_guard.reset();
-                            //join线程和合并文件
-                            for(auto & thread : task->threads)
-                            {
-                                thread.join();
-                            }
-                            std::thread merge_thread([this,task]() {
-                                merge_file(task->output_path,task);
-                                delete_temp_file(task);
+                            spdlog::info("All segments finished, notifying main thread.");
+                            // task->io_context.post([this, task]() { check_and_finalize_download(task); });
+                            boost::asio::post(*(task->io_context), [task, this]() {
+                                check_and_finalize_download(task);
                             });
-                            merge_thread.detach();
+
                         }
                     });
                 });
+
             }
-            //这里是for循环结束
-            {
-                std::lock_guard<std::mutex> lock(downloader_mtx);
-                active_downloads_.erase(task);
-            }
-            start_next_download();
         });
 
     });
@@ -322,6 +333,7 @@ void downloader::handle_error(std::shared_ptr<tcp_client> client)
     {
         if(it->second == client)
         {
+            std::cout << "handle_error 触发" << std::endl;
             active_downloads_.erase(it);
             break;
         }
@@ -342,6 +354,10 @@ void downloader::merge_file(const std::string &output_path, std::shared_ptr<Down
     std::sort(task->temp_files.begin(),task->temp_files.end(),compare);
     for(const auto& temp_file : task->temp_files)
     {
+        if (!std::filesystem::exists(temp_file)) {
+            spdlog::error("Temp file not found: {}", temp_file);
+            continue;
+        }
         std::ifstream file_data(temp_file,std::ios::in | std::ios::binary);
         if(!file_data.is_open())
         {
@@ -357,18 +373,70 @@ void downloader::merge_file(const std::string &output_path, std::shared_ptr<Down
 
 void downloader::delete_temp_file(const std::shared_ptr<DownloadTask> & task)
 {
-    for(const auto& filename : task->temp_files)
-    {
-        try
-        {
-            std::filesystem::remove(filename);//删除文件
-            std::cout << "temp file" + filename << "delete success" << std::endl;
-        }
-        catch (const std::filesystem::filesystem_error & e)
-        {
-            std::cerr << "Error deleting file" << e.what() << std::endl;
+    std::lock_guard<std::mutex> lock(task->task_mtx); // 确保线程安全
+    for (const auto& filename : task->temp_files) {
+        if (std::filesystem::exists(filename)) {
+            try {
+                std::filesystem::remove(filename);
+                spdlog::info("Deleted temp file: {}", filename);
+            } catch (const std::filesystem::filesystem_error& e) {
+                spdlog::error("Error deleting {}: {}", filename, e.what());
+            }
         }
     }
+    task->temp_files.clear(); // 清空列表，防止重复删除
+}
+
+void downloader::check_and_finalize_download(std::shared_ptr<DownloadTask> task)
+{
+    std::lock_guard<std::mutex> lock(downloader_mtx);
+
+    if (task->active_segments == 0 && !task->merged) {
+        task->merged = true;
+        spdlog::info("All segments finished. Stopping io_context...");
+
+        // **确保 io_context 停止**
+        spdlog::info("Resetting work_guard...");
+        task->work_guard.reset();
+        spdlog::info("work_guard reset complete. Calling io_context.stop()...");
+
+        task->io_context->stop();
+        spdlog::info("io_context.stop() called. Now joining threads...");
+
+        std::vector<std::thread> threads_to_join;
+        for (auto& thread : task->threads) {
+            if (thread.joinable()) {
+                threads_to_join.push_back(std::move(thread));
+            }
+        }
+        task->threads.clear();
+
+        // 在独立线程中执行 join() 和文件合并
+        std::thread finalizer([threads_to_join = std::move(threads_to_join), this, task]() mutable {
+            // 安全地 join 所有线程
+            for (auto& thread : threads_to_join) {
+                if (thread.joinable()) {
+                    try {
+                        thread.join();
+                    } catch (const std::system_error& e) {
+                        spdlog::error("Thread join failed: {}", e.what());
+                    }
+                }
+            }
+            spdlog::info("All segments end and merge begins");
+
+        // **在独立线程中启动 `merge_file()`
+            merge_file(task->output_path, task);
+            delete_temp_file(task);
+            {
+                std::lock_guard<std::mutex> lock(downloader_mtx);
+                active_downloads_.erase(task);
+                start_next_download();
+            }
+        });
+        finalizer.detach(); // 分离线程，避免阻塞
+    }
+
 }
 
 size_t downloader::parse_head_response(const std::string& response)

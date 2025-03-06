@@ -13,6 +13,7 @@ Content-Type: application/octet-stream\r\n
 
 #include <iostream>
 #include <fstream>
+#include <spdlog/spdlog.h>
 tcp_client::tcp_client(const std::shared_ptr<boost::asio::io_context>& io_context,bool use_ssl,const std::shared_ptr<boost::asio::ssl::context>& context)
 : resolver_(*io_context) , use_ssl_(use_ssl)
 {
@@ -137,18 +138,6 @@ void tcp_client::cancel()
     if (ssl_socket_) ssl_socket_->lowest_layer().close(ec);
 }
 
-void tcp_client::async_write_file(std::shared_ptr<std::ofstream> file_stream,
-    const std::shared_ptr<std::vector<char>> &buffer, size_t length)
-{
-    boost::asio::async_write(*file_stream, boost::asio::buffer(*buffer, length),
-        [file_stream](boost::system::error_code ec, std::size_t /*length*/) {
-        if (ec) {
-            std::cerr << "Error writing to file: " << ec.message() << std::endl;
-            file_stream->close();
-            std::exit(EXIT_FAILURE);
-        }
-    });
-}
 
 template<typename StreamType>
     void tcp_client::do_send_head_request(StreamType & stream,const std::string& request,std::function<void(const std::string &)> on_response,std::shared_ptr<tcp_client> self)
@@ -195,6 +184,7 @@ void tcp_client::do_send_get_request(StreamType &stream, const std::shared_ptr<D
         [on_response,self,i,output_path,task](const boost::system::error_code &ec,size_t length) {
         if(!ec)
         {
+            spdlog::info(i + "ready to read");
             self->read_get_response(task,i,output_path,on_response);
         }else
         {
@@ -276,7 +266,7 @@ void tcp_client::do_async_read_remain_data(StreamType &stream, std::function<voi
     std::size_t bytes_to_read = std::min<std::size_t>(buffer_size, remaining_bytes);
 
     stream.async_read_some(boost::asio::buffer(*buffer,bytes_to_read),
-        [file_stream,buffer,self,remaining_bytes,on_response](boost::system::error_code ec,size_t length) {
+        [file_stream,buffer,self,remaining_bytes,on_response,&stream](boost::system::error_code ec,size_t length) {
         if(ec)
         {
             std::cerr << "Read error: " << ec.message() << std::endl;
@@ -284,17 +274,24 @@ void tcp_client::do_async_read_remain_data(StreamType &stream, std::function<voi
             std::exit(EXIT_FAILURE);
             return;
         }
-        self->async_write_file(file_stream,buffer,static_cast<std::streamsize>(length));
-        std::size_t new_remaining = remaining_bytes - length;
-            if (new_remaining > 0) {
-                // 继续读取剩余数据
-                self->async_read_remain_data(on_response,new_remaining,file_stream);
-            } else
-            {
-                // 所有数据读取完毕，关闭文件并调用完成回调
+            file_stream->write(buffer->data(), static_cast<std::streamsize>(length));
+            if (!file_stream->good()) {
+                std::cerr << "File write error.\n";
                 file_stream->close();
-                if(on_response)
-                {
+                std::exit(EXIT_FAILURE);
+                return;
+            }
+            // 计算剩余
+            std::size_t new_remaining = remaining_bytes - length;
+            if (new_remaining > 0) {
+                // 继续异步读
+                self->do_async_read_remain_data(stream, on_response, new_remaining, file_stream, self);
+            } else {
+                file_stream->flush();  // 强制写入磁盘
+                // 全部读完
+                file_stream->close();
+                spdlog::info("File——stream closed");
+                if (on_response) {
                     on_response();
                 }
             }

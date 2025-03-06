@@ -11,7 +11,7 @@
 
 #include <boost/asio/ssl.hpp>
 //该类封装tcp连接、数据读写
-class tcp_client : std::enable_shared_from_this<tcp_client>{
+class tcp_client : public std::enable_shared_from_this<tcp_client>{
 public:
     explicit tcp_client(const std::shared_ptr<boost::asio::io_context>& io_context,bool use_ssl = false,const std::shared_ptr<boost::asio::ssl::context>& context = nullptr);
     void async_connect(const std::string& host, int port,
@@ -24,7 +24,6 @@ public:
          std::size_t remaining_bytes,std::shared_ptr<std::ofstream> file_stream);//读取剩余文件数据
     void cancel();
 
-    void async_write_file(std::shared_ptr<std::ofstream> file_stream, const std::shared_ptr<std::vector<char>>& buffer, size_t length);
 
 
 private:

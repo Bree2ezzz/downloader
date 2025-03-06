@@ -14,7 +14,7 @@
 #include <utility>
 #include <filesystem>
 #include "DownloadTask.h"
-
+#include <spdlog/spdlog.h>
 class downloader {
 public:
     explicit downloader(size_t max_concurrent);
@@ -44,6 +44,7 @@ private:
     void handle_error(std::shared_ptr<DownloadTask> task);
     void merge_file(const std::string& output_path,std::shared_ptr<DownloadTask> task);
     auto delete_temp_file(const std::shared_ptr<DownloadTask>& task) -> void;
+    void check_and_finalize_download(std::shared_ptr<DownloadTask> task);
 
 
     size_t max_concurrent_downloads_;    //最大同时下载数

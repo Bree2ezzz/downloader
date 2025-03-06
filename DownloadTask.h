@@ -14,6 +14,7 @@ struct DownloadTask {
     std::atomic<int> active_segments{0};
     std::vector<std::string> temp_files;
     std::mutex task_mtx;//用于保护temp_files
+    std::atomic<bool> merged{false}; // 新增标志位，防止重复合并
 
 
     std::atomic<bool> paused{false};
@@ -37,7 +38,10 @@ inline DownloadTask::~DownloadTask()
 {
     for(auto & thread : threads)
     {
-        thread.join();
+        if(thread.joinable())
+        {
+            thread.join();
+        }
     }
 }
 #endif //DOWNLOADTASK_H
